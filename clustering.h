@@ -20,10 +20,89 @@
 #include <opencv2/core.hpp>
 #include <functional>
 
+#include <opencv2/cudev.hpp>
+
 namespace clustering
 {
 
+class DistanceBody
+{
+public:
 
+//    typedef float(*function_type)(const float*, const float*, int);
+    typedef std::function<float(const float*, const float*, int)> function_type;
+    typedef float(*function_ptr)(const float*, const float*, int);
+
+    inline DistanceBody():
+        fun(nullptr)
+    {}
+
+    inline DistanceBody(std::nullptr_t):
+        fun(nullptr)
+    {}
+
+    inline DistanceBody(const function_type _fun):
+        fun(_fun)
+    {}
+
+    inline DistanceBody(const DistanceBody& obj):
+        fun(obj.fun)
+    {}
+
+    inline DistanceBody(DistanceBody&& obj):
+        fun(std::move(obj.fun))
+    {}
+
+    virtual ~DistanceBody() = default;
+
+    inline DistanceBody& operator=(const DistanceBody& obj)
+    {
+        if(std::addressof(obj) != this)
+            this->fun = obj.fun;
+
+        return (*this);
+    }
+
+    inline DistanceBody& operator=(DistanceBody&& obj)
+    {
+        if(std::addressof(obj) != this)
+            this->fun = std::move(obj.fun);
+
+        return (*this);
+    }
+
+    virtual float operator()(const float* a, const float* b, int dims)const
+    {
+        return this->fun(a,b,dims);
+    }
+
+    virtual float operator ()(const float& a, const float& b)const
+    {
+        return this->fun(&a, &b, 1);
+    }
+
+    template<class T=function_ptr>
+    inline const T* target()const
+    {
+        return this->fun.target<T>();
+    }
+
+    template<class T=function_ptr>
+    inline T* target()
+    {
+        return this->fun.target<T>();
+    }
+
+    inline operator bool()const
+    {
+        return (bool)this->fun;
+    }
+
+protected:
+
+    function_type fun;
+
+};
 
 /** @brief Finds centers of clusters and groups input samples around the clusters.
 
@@ -62,8 +141,9 @@ double kmeans( cv::InputArray _data,
                cv::TermCriteria criteria,
                int attempts,
                int flags,
-               cv::InputOutputArray _centers,
-               const std::function<float(const float*, const float*, int)>& fun = nullptr
+               cv::OutputArray _centers,
+               const DistanceBody& norm = nullptr
+//               const std::function<float(const float*, const float*, int)>& fun = nullptr
                );
 
 /** @brief Finds centers of clusters and groups input samples around the clusters.
@@ -105,8 +185,9 @@ double mini_batch_kmeans(cv::InputArray _data,
                           cv::TermCriteria criteria,
                           int attempts,
                           int flags,
-                          cv::InputOutputArray _centers,
-                          const std::function<float(const float*, const float*, int)>& fun = nullptr
+                          cv::OutputArray _centers,
+//                          const std::function<float(const float*, const float*, int)>& fun = nullptr
+                          const DistanceBody& norm = nullptr
                           );
 
 
@@ -116,6 +197,55 @@ double dbscan(cv::InputArray _data,
               cv::OutputArray _labels,
               cv::OutputArray _centres = cv::noArray());
 
+
+
+namespace cuda
+{
+
+/** @brief Finds centers of clusters and groups input samples around the clusters.
+
+The function kmeans implements a k-means algorithm that finds the centers of cluster_count clusters
+and groups the input samples around the clusters. As an output, \f$\texttt{labels}_i\f$ contains a
+0-based cluster index for the sample stored in the \f$i^{th}\f$ row of the samples matrix.
+This implementation use cuda
+
+@param data Data for clustering. An array of N-Dimensional points with float coordinates is needed.
+Examples of this array can be:
+-   Mat points(count, 2, CV_32F);
+-   Mat points(count, 1, CV_32FC2);
+-   Mat points(1, count, CV_32FC2);
+-   std::vector\<cv::Point2f\> points(sampleCount);
+@param K Number of clusters to split the set by.
+@param bestLabels Input/output integer array that stores the cluster indices for every sample.
+@param criteria The algorithm termination criteria, that is, the maximum number of iterations and/or
+the desired accuracy. The accuracy is specified as criteria.epsilon. As soon as each of the cluster
+centers moves by less than criteria.epsilon on some iteration, the algorithm stops.
+@param attempts Flag to specify the number of times the algorithm is executed using different
+initial labellings. The algorithm returns the labels that yield the best compactness (see the last
+function parameter).
+@param flags Flag that can take values of cv::KmeansFlags
+@param centers Output matrix of the cluster centers, one row per each cluster center.
+@param fun metric to use for clustering, if null or nullptr, the norm L2 is used.
+@return The function returns the compactness measure that is computed as
+\f[\sum _i  \| \texttt{samples} _i -  \texttt{centers} _{ \texttt{labels} _i} \| ^2\f]
+after every attempt. The best (minimum) value is chosen and the corresponding labels and the
+compactness value are returned by the function. Basically, you can use only the core of the
+function, set the number of attempts to 1, initialize labels each time using a custom algorithm,
+pass them with the ( flags = KMEANS_USE_INITIAL_LABELS ) flag, and then choose the best
+(most-compact) clustering.
+*/
+double kmeans( cv::InputArray _data,
+               int K,
+               cv::InputOutputArray _bestLabels,
+               cv::TermCriteria criteria,
+               int attempts,
+               int flags,
+               cv::OutputArray _centers,
+               const std::function<float(const float*, const float*, int)>& fun = nullptr
+               );
+
+
+}
 
 }
 

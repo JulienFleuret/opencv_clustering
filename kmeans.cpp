@@ -10,15 +10,21 @@
 
 //THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// This file is deeply insipired by OpenCV's KMeans implementation.
+
+// Author: Julien FLEURET, julien.fleuret.1@ulaval.ca
+
 
 #include "clustering.h"
-
-#include <numeric>
+#include "clustering.priv.hpp"
 
 #include <opencv2/core/cv_cpu_helper.h>
 #include <opencv2/core/hal/intrin.hpp>
+#include <opencv2/core/hal/hal.hpp>
 
-#include <immintrin.h>
+#include <numeric>
+#include <atomic>
+
 
 namespace clustering
 {
@@ -26,162 +32,166 @@ namespace clustering
 namespace
 {
 
-void generateRandomCenter(const std::vector<cv::Vec2f>& box, float* center, cv::RNG& rng)
+class KMeansUpdateCentres : public cv::ParallelLoopBody
 {
-    size_t j;
-    const size_t dims = box.size();
-    const float margin = 1.f/dims;
-    const float cst = 1.f+margin*2.f;
 
-    for( j = 0; j < dims; j++ )
+public:
+
+    inline KMeansUpdateCentres(const cv::Mat& _data, const cv::Mat& _labels, cv::Mat& _centers, std::vector<int>& _counters):
+        counters(reinterpret_cast<std::atomic_int*>(_counters.data())),
+        labels(_labels),
+        data(_data),
+        centers(_centers)
+    {}
+
+    virtual ~KMeansUpdateCentres() = default;
+
+    virtual void operator()(const cv::Range& range)const
     {
-        const cv::Vec2f& vb = box[j];
+        static const int dims = this->data.cols;
 
-        center[j] = ((float)rng*cst-margin)*(vb(1) - vb(0)) + vb(0);
+        cv::Mat lcentres = cv::Mat::zeros(this->centers.size(), this->centers.type());
+
+        for(int i=range.start; i<range.end; i++)
+        {
+            const float* sample = data.ptr<float>(i);
+            int k = labels.at<int>(i);
+            float* center = lcentres.ptr<float>(k);
+
+            cv::hal::add32f(sample, 0,
+                            center, 0,
+                            center, 0,
+                            dims, 1, nullptr);
+
+            this->counters[k]++;
+        }
+
+        cv::AutoLock lck(this->mtx);
+
+        cv::hal::add32f(this->centers.ptr<float>(), this->centers.step,
+                        lcentres.ptr<float>(), lcentres.step,
+                        this->centers.ptr<float>(), this->centers.step,
+                        this->centers.cols, this->centers.rows, nullptr);
+
     }
-}
 
-class KMeansPPDistanceComputer : public cv::ParallelLoopBody
+private:
+
+    std::atomic_int* counters;
+
+    const cv::Mat& labels;
+    const cv::Mat& data;
+    cv::Mat& centers;
+
+    mutable cv::Mutex mtx;
+
+
+};
+
+class KMeansFindLabel : public cv::ParallelLoopBody
 {
 public:
 
     typedef float(*function_type)(const float*, const float*, int);
 
-    inline KMeansPPDistanceComputer( float *_tdist2,
-                              const float *_data,
-                              const float *_dist,
-                              int _dims,
-                              size_t _step,
-                              size_t _stepci,
-                              const function_type _fun)
-        : tdist2(_tdist2),
-          data(_data),
-          dist(_dist),
-          dims(_dims),
-          step(_step),
-          stepci(_stepci),
-          fun(_fun)
+    inline KMeansFindLabel(const cv::Mat& _data,
+                           const cv::Mat& _labels,
+                           const float* old_center,
+                           const int& _max_k,
+                           double& _max_dist,
+                           int& _farest_i,
+                           const function_type _fun):
+        data(_data),
+        labels(_labels),
+        _old_center(old_center),
+        max_k(_max_k),
+        max_dist(_max_dist),
+        farest_i(_farest_i),
+        fun(_fun)
     {}
 
-    virtual ~KMeansPPDistanceComputer() = default;
+    virtual ~KMeansFindLabel() = default;
 
-    virtual void operator()( const cv::Range& range ) const
+    virtual void operator()(const cv::Range& range)const
     {
-        const int begin = range.start;
-        const int end = range.end;
+        static const int dims = this->data.cols;
 
-        const float* tmp_left = data + step*begin;
-        const float* tmp_right = data + stepci;
+        double lmax_dist = 0.;
+        int lfarthest_i = 0;
 
-        for ( int i = begin; i<end; i++, tmp_left+=step )
+        if(!this->fun)
         {
-//            float tmp = this->fun(data + step*i, data + stepci, dims);
-            float tmp = this->fun(tmp_left, tmp_right, dims);
+            for(int i=range.start; i<range.end; i++)
+            {
+                if( labels.at<int>(i) != max_k )
+                    continue;
+                const float* sample = data.ptr<float>(i);
 
-//            tdist2[i] = std::min(cv::normL2Sqr(data + step*i, data + stepci, dims), dist[i]);
+                double dist = fun(sample, _old_center, dims);
+                dist*=dist;
 
-            tdist2[i] = std::min(tmp * tmp, dist[i]);
+                if( lmax_dist <= dist )
+                {
+                    lmax_dist = dist;
+                    lfarthest_i = i;
+                }
+            }
+        }
+        else
+        {
+            for(int i=range.start; i<range.end; i++)
+            {
+                if( labels.at<int>(i) != max_k )
+                    continue;
+
+                const float* sample = data.ptr<float>(i);
+
+                double dist = cv::normL2Sqr(sample, _old_center, dims);
+
+                if( lmax_dist <= dist )
+                {
+                    lmax_dist = dist;
+                    lfarthest_i = i;
+                }
+            }
+        }
+
+        cv::AutoLock lck(this->mtx);
+
+        if(this->max_dist <= lmax_dist)
+        {
+            this->max_dist = lmax_dist;
+            this->farest_i = lfarthest_i;
         }
     }
 
 private:
-    KMeansPPDistanceComputer& operator=(const KMeansPPDistanceComputer&); // to quiet MSVC
 
-    float *tdist2;
-    const float *data;
-    const float *dist;
-    const int dims;
-    const size_t step;
-    const size_t stepci;
+    const cv::Mat& data;
+    const cv::Mat& labels;
+    const float* _old_center;
+    const int& max_k;
+    double& max_dist;
+    int& farest_i;
     const function_type fun;
+
+    mutable cv::Mutex mtx;
+
+
 };
 
-/*
-k-means center initialization using the following algorithm:
-Arthur & Vassilvitskii (2007) k-means++: The Advantages of Careful Seeding
-*/
-void generateCentersPP(const cv::Mat& _data, cv::Mat& _out_centers,
-                              int K, cv::RNG& rng, int trials, float(*fun)(const float*, const float*, int))
-{
 
-    int i, j, k, dims = _data.cols, N = _data.rows, N_algn = cv::alignSize(N,4);
-    const float* data = _data.ptr<float>(0);
-    size_t step = _data.step/sizeof(data[0]);
-    std::vector<int> _centers(K);
-    int* centers = &_centers[0];
-    std::vector<float> _dist(N_algn*3);
-    float* dist = &_dist[0], *tdist = dist + N_algn, *tdist2 = tdist + N_algn;
-    double sum0 = 0;
+//class KMeansFinalizeCentres : public cv::ParallelLoopBody
+//{
+//private:
 
-    centers[0] = (unsigned)rng % N;
+//    const std::vector<int>& counters;
+//    const cv::Mat& old_centers;
+//    const int& iter;
 
-    for( i = 0; i < N; i++ )
-    {
-//        dist[i] = cv::normL2Sqr(data + step*i, data + step*centers[0], dims);
-        float tmp = fun(data + step*i, data + step*centers[0], dims);
-        dist[i] = tmp*tmp;
-        sum0 += dist[i];
-    }
+//    cv::Mat& centers;
 
-    cv::Vec4f buffer;
-    for( k = 1; k < K; k++ )
-    {
-        double bestSum = std::numeric_limits<double>::max();
-        int bestCenter = -1;
-
-        for( j = 0; j < trials; j++ )
-        {
-            double p = (double)rng*sum0, s = 0.;
-
-            for( i = 0; i < N-1; i++ )
-                if( (p -= dist[i]) <= 0 )
-                    break;
-            int ci = i;
-
-            cv::parallel_for_(cv::Range(0, N),
-                         KMeansPPDistanceComputer(tdist2, data, dist, dims, step, step*ci, fun),
-                              cvCeil(N / static_cast<double>(cv::getNumberOfCPUs())));
-            i=0;
-            float* it_tdist2 = tdist2;
-
-            cv::v_float32x4 v_s = cv::v_setzero_f32();
-            for(;i<=N-4;i+=4, it_tdist2+=4)
-            {
-                cv::v_float32x4 v_td = cv::v_load(it_tdist2);
-                v_s+= v_td;
-            }
-            cv::v_store(buffer.val, v_s);
-
-            s = std::accumulate(buffer.val, buffer.val+4, 0.);
-
-            for( ; i < N; i++, it_tdist2++ )
-//                s += tdist2[i];
-                s+=*it_tdist2;
-
-
-            if( s < bestSum )
-            {
-                bestSum = s;
-                bestCenter = ci;
-                std::swap(tdist, tdist2);
-            }
-        }
-
-        centers[k] = bestCenter;
-        sum0 = bestSum;
-
-        std::swap(dist, tdist);
-    }
-
-    for( k = 0; k < K; k++ )
-    {
-        const float* src = data + step*centers[k];
-        float* dst = _out_centers.ptr<float>(k);
-//        for( j = 0; j < dims; j++ )
-//            dst[j] = src[j];
-        std::memcpy(dst, src, dims*sizeof(float));
-    }
-}
+//};
 
 class KMeansDistanceComputer : public cv::ParallelLoopBody
 {
@@ -257,26 +267,28 @@ private:
     const function_type fun;
 };
 
+
+
 }
 
-double kmeans( cv::InputArray _data,
+double kmeans(cv::InputArray _data,
                int K,
                cv::InputOutputArray _bestLabels,
                cv::TermCriteria criteria,
                int attempts,
                int flags,
-               cv::InputOutputArray _centers,
-               const std::function<float(const float*, const float*, int)>& _fun
+               cv::OutputArray _centers,
+               const DistanceBody &norm
                )
 {
-    if(!_fun)
-        return cv::kmeans(_data, K, _bestLabels, criteria, attempts, flags, _centers);
+//    if(!_fun)
+//        return cv::kmeans(_data, K, _bestLabels, criteria, attempts, flags, _centers);
 
     typedef float(*function_type)(const float*, const float*, int);
 
-    function_type fun = _fun ? *_fun.target<function_type>() : (function_type)cv::normL2Sqr;
+    function_type fun = norm ? *norm.target<function_type>() : (function_type)cv::normL2Sqr;
 
-    const int SPP_TRIALS = 3;
+    static const int SPP_TRIALS = 3;
     cv::Mat data0 = _data.getMat();
     bool isrow = data0.rows == 1;
     int N = isrow ? data0.cols : data0.rows;
@@ -311,33 +323,9 @@ double kmeans( cv::InputArray _data,
     }
     int* labels = _labels.ptr<int>();
 
-    cv::Mat centers, old_centers(K,dims, type), temp(1, dims, type);
-
-    bool preprocess_labels = false;
+    cv::Mat centers(K, dims, type), old_centers(K,dims, type), temp(1, dims, type);
 
 
-
-    if(_centers.empty())
-        centers.create(K,dims,type);
-    else
-    {
-        CV_Assert(_centers.rows() == K && _centers.cols() == dims);
-
-        centers = _centers.getMat();
-
-        if(cv::countNonZero(centers))
-        {
-           if(flags&cv::KMEANS_PP_CENTERS)
-               flags &= ~cv::KMEANS_PP_CENTERS;
-
-           if(flags&cv::KMEANS_RANDOM_CENTERS)
-               flags &= ~ cv::KMEANS_RANDOM_CENTERS;
-
-           flags |= cv::KMEANS_USE_INITIAL_LABELS;
-
-           preprocess_labels = true;
-        }
-    }
 
 
 //    cv::Mat centers(K, dims, type), old_centers(K, dims, type), temp(1, dims, type);
@@ -345,7 +333,7 @@ double kmeans( cv::InputArray _data,
     std::vector<cv::Vec2f> _box(dims);
     cv::Mat dists(1, N, CV_64F);
     cv::Vec2f* box = &_box[0];
-    double best_compactness = DBL_MAX, compactness = 0;
+    double best_compactness = std::numeric_limits<double>::max(), compactness = 0;
     cv::RNG& rng = cv::theRNG();
     int a, iter, i, j, k;
 
@@ -387,8 +375,6 @@ double kmeans( cv::InputArray _data,
     }
 
 
-    if(preprocess_labels)
-        cv::parallel_for_(cv::Range(0, N), KMeansDistanceComputer(dists.ptr<double>(), labels, data, centers, fun), cvCeil(N / static_cast<double>(cv::getNumberOfCPUs())) );
 
 
     for( a = 0; a < attempts; a++ )
@@ -417,7 +403,6 @@ double kmeans( cv::InputArray _data,
                         CV_Assert( (unsigned)labels[i] < (unsigned)K );
                 }
 
-
                 // compute centers
 //                centers = cv::Scalar(0);
 //                for( k = 0; k < K; k++ )
@@ -426,43 +411,8 @@ double kmeans( cv::InputArray _data,
                 std::memset(centers.data, 0, centers.rows*centers.step);
                 std::memset(counters.data(), 0, counters.size()*sizeof(int));
 
-                for( i = 0; i < N; i++ )
-                {
-                    sample = data.ptr<float>(i);
-                    k = labels[i];
-                    float* center = centers.ptr<float>(k);
-                    j=0;
 
-                    float* it_center = center;
-                    const float* it_sample = sample;
-
-#if CV_AVX
-                    for(;j<=dims-8;j+=8, it_center+=8, it_sample+=8)
-                    {
-                        __m256 v_centre = _mm256_loadu_ps(it_center);
-                        __m256 v_sample = _mm256_loadu_ps(it_sample);
-
-                        v_centre = _mm256_add_ps(v_centre, v_sample);
-
-                        _mm256_storeu_ps(it_center, v_centre);
-                    }
-#endif
-
-                    for(;j<=dims-4;j+=4, it_center+=4, it_sample+=4)
-                    {
-                        cv::v_float32x4 v_centre = cv::v_load(it_center);
-                        cv::v_float32x4 v_sample = cv::v_load(it_sample);
-
-                        v_centre+=v_sample;
-
-                        cv::v_store(it_center, v_centre);
-                    }
-
-                    for( ; j < dims; j++, it_center++, it_sample++ )
-//                        center[j] += sample[j];
-                        *it_center += *it_sample;
-                    counters[k]++;
-                }
+                cv::parallel_for_(cv::Range(0,N),KMeansUpdateCentres(data, _labels, centers, counters), cvCeil(N / static_cast<double>(cv::getNumberOfCPUs())) );
 
                 if( iter > 0 )
                     max_center_shift = 0;
@@ -490,101 +440,18 @@ double kmeans( cv::InputArray _data,
                     float* _old_center = temp.ptr<float>(); // normalized
                     float scale = 1.f/counters[max_k];
 
-                    float* it_oc = old_center;
-                    float* it_tmp = _old_center;
+                    apply_scale(old_center, scale, _old_center, dims);
 
-                    j=0;
+                    cv::parallel_for_(cv::Range(0, N), KMeansFindLabel(data, _labels, _old_center, max_k, max_dist, farthest_i, fun), cvCeil(N / static_cast<double>(cv::getNumberOfCPUs())));
 
-#if CV_AVX
-                    __m256 v_scale256 = _mm256_set1_ps(scale);
-
-                    for(;j<=dims-8; j+=8, it_oc+=8, it_tmp+=8)
-                    {
-                        __m256 v_oc = _mm256_loadu_ps(it_oc);
-
-                        v_oc = _mm256_mul_ps(v_oc, v_scale256);
-
-                        _mm256_storeu_ps(it_tmp, v_oc);
-                    }
-#endif
-
-                    cv::v_float32x4 v_scale = cv::v_setall_f32(scale);
-
-                    for(;j<=dims-4;j+=4, it_oc+=4, it_tmp+=4)
-                        cv::v_store(it_tmp, cv::v_load(it_oc)*v_scale);
-
-
-                    for( ; j < dims; j++, it_oc++, it_tmp++ )
-                        *it_tmp = *it_oc*scale;
-
-                    for( i = 0; i < N; i++ )
-                    {
-                        if( labels[i] != max_k )
-                            continue;
-                        sample = data.ptr<float>(i);
-//                        double dist = cv::normL2Sqr(sample, _old_center, dims);
-                        double dist = fun(sample, _old_center, dims);
-                        dist*=dist;
-
-                        if( max_dist <= dist )
-                        {
-                            max_dist = dist;
-                            farthest_i = i;
-                        }
-                    }
 
                     counters[max_k]--;
                     counters[k]++;
                     labels[farthest_i] = k;
                     sample = data.ptr<float>(farthest_i);
 
-                    j=0;
+                    update_new_old_centres(sample, new_center, old_center, dims);
 
-                    it_oc = old_center;
-                    float* it_nc = new_center;
-                    const float* it_sample = sample;
-
-#if CV_AVX
-                    for(;j<=dims-8;j+=8,
-                        it_oc+=8,
-                        it_nc+=8,
-                        it_sample+=8)
-                    {
-                        __m256 v_oc = _mm256_loadu_ps(it_oc);
-                        __m256 v_nc = _mm256_loadu_ps(it_nc);
-                        __m256 v_s = _mm256_loadu_ps(it_sample);
-
-                        v_oc = _mm256_sub_ps(v_oc, v_s);
-                        v_nc = _mm256_add_ps(v_nc, v_s);
-
-                        _mm256_storeu_ps(it_oc, v_oc);
-                        _mm256_storeu_ps(it_nc, v_nc);
-                    }
-#endif
-
-                    for(;j<=dims-4;j+=4,
-                        it_oc+=4,
-                        it_nc+=4,
-                        it_sample+=4)
-                    {
-                        cv::v_float32x4 v_oc = cv::v_load(it_oc);
-                        cv::v_float32x4 v_nc = cv::v_load(it_nc);
-                        cv::v_float32x4 v_s = cv::v_load(it_sample);
-
-                        v_oc -= v_s;
-                        v_nc += v_s;
-
-                        cv::v_store(it_oc, v_oc);
-                        cv::v_store(it_nc, v_nc);
-                    }
-
-                    for( ; j < dims; j++, it_oc++, it_nc++, it_sample++ )
-                    {
-                        float v_s = *it_sample;
-
-                        *it_oc -= v_s;
-                        *it_nc += v_s;
-                    }
                 }
 
                 for( k = 0; k < K; k++ )
@@ -598,7 +465,9 @@ double kmeans( cv::InputArray _data,
 
                     j=0;
 
+#if CV_SIMD128
                     cv::v_float32x4 v_scale = cv::v_setall_f32(scale);
+#endif
 
 #if CV_AVX
                     __m256 v_scale256 = _mm256_set1_ps(scale);
@@ -640,7 +509,9 @@ double kmeans( cv::InputArray _data,
 
                         j=0;
 
+#if CV_SIMD128
                         cv::v_float32x4 v_dist = cv::v_setzero_f32();
+#endif
 
 #if CV_AVX
                         __m256 v_dist256 = _mm256_setzero_ps();
@@ -665,20 +536,50 @@ double kmeans( cv::InputArray _data,
                         dist = std::accumulate(buffer, buffer+8, 0.);
 #endif
 
+#if CV_SIMD128
                         for(;j<=dims-4;j+=4, it_old_centre+=4, it_centre+=4)
                         {
                             cv::v_float32x4 v_t = cv::v_load(it_centre) - cv::v_load(it_old_centre);
 
+#if CV_SSE && CV_FMA3
+                            v_dist.val = _mm_fmadd_ps(v_t.val, v_t.val, v_dist.val);
+#else
                             v_dist += v_t*v_t;
+#endif
                         }
                         cv::v_store_aligned(buffer, v_dist);
+#else
+                        for(;j<=dims-4;j+=4, it_old_centre+=4, it_centre+=4)
+                        {
+                            float t0 = it_centre[0] - it_old_centre[0];
+                            float t1 = it_centre[1] - it_old_centre[1];
 
+                            t0*=t0;
+                            t1*=t1;
+
+                            dist += t0;
+                            dist += t1;
+
+                            t0 = it_centre[2] - it_old_centre[2];
+                            t1 = it_centre[3] - it_old_centre[3];
+
+                            t0*=t0;
+                            t1*=t1;
+
+                            dist += t0;
+                            dist += t1;
+                        }
+#endif
                         dist += std::accumulate(buffer, buffer+4, 0.);
 
                         for( ; j < dims; j++, it_centre++, it_old_centre++ )
                         {
                             double t = *it_centre - *it_old_centre;
+#if FP_FAST_FMAF
+                            dist = std::fmaf(t,t,dist);
+#else
                             dist += t*t;
+#endif
                         }
                         max_center_shift = std::max(max_center_shift, dist);
                     }

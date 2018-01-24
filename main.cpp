@@ -10,23 +10,77 @@
 
 //THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// Author: Julien FLEURET, julien.fleuret.1@ulaval.ca
+
 
 #include <opencv2/highgui.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/core/cuda.hpp>
+
 #include <iostream>
 
 #include "clustering.h"
+
+#include <chrono>
+
+class chrono_t
+{
+private:
+
+    std::chrono::steady_clock::time_point _start;
+    std::chrono::steady_clock::time_point _stop;
+
+public:
+
+    chrono_t() = default;
+
+    chrono_t(const chrono_t&) = delete;
+    chrono_t(chrono_t&&) = delete;
+
+    ~chrono_t() = default;
+
+    chrono_t& operator =(const chrono_t&) = delete;
+    chrono_t& operator =(chrono_t&&) = delete;
+
+    inline void start()
+    {
+        this->_start = std::chrono::steady_clock::now();
+    }
+
+    inline void stop()
+    {
+        this->_stop = std::chrono::steady_clock::now();
+    }
+
+    inline std::intmax_t getms()const{ return std::chrono::duration_cast<std::chrono::milliseconds>(this->_stop - this->_start).count();}
+    inline std::intmax_t getmus()const{ return std::chrono::duration_cast<std::chrono::microseconds>(this->_stop - this->_start).count();}
+};
+
+chrono_t chrono;
+
+
 
 void test_kmeans(); // for evaluate mini batch kmeans modify this function.
 
 void test_dbscan();
 
+
+
 int main( int /*argc*/, char** /*argv*/ )
 {
+
+
+
     test_dbscan();
+    test_kmeans();
 
     return EXIT_SUCCESS;
+}
+
+float normL2(const float* a, const float* b, int dims)
+{
+    return std::sqrt(cv::normL2Sqr(a,b,dims));
 }
 
 void test_kmeans()
@@ -48,7 +102,7 @@ void test_kmeans()
     for(;;)
     {
         int k, clusterCount = rng.uniform(2, MAX_CLUSTERS+1);
-        int i, sampleCount = rng.uniform(1, 1001);
+        int i, sampleCount = rng.uniform(1, 1000001);
         cv::Mat points(sampleCount, 1, CV_32FC2), labels;
 
         clusterCount = std::min(clusterCount, sampleCount);
@@ -68,6 +122,8 @@ void test_kmeans()
 
         randShuffle(points, 1, &rng);
 
+        chrono.start();
+
 //        double compactness = cv::kmeans(points, clusterCount, labels,
 //            cv::TermCriteria( cv::TermCriteria::EPS+cv::TermCriteria::COUNT, 10, 1.0),
 //               3, cv::KMEANS_PP_CENTERS, centers);
@@ -76,14 +132,17 @@ void test_kmeans()
 //            cv::TermCriteria( cv::TermCriteria::EPS+cv::TermCriteria::COUNT, 10, 1.0),
 //               3, cv::KMEANS_PP_CENTERS, centers);
 
-        double compactness = clustering::mini_batch_kmeans(points, clusterCount, 64, labels,
+        double compactness = clustering::mini_batch_kmeans(points, clusterCount, 1024, labels,
             cv::TermCriteria( cv::TermCriteria::EPS+cv::TermCriteria::COUNT, 10, 1.0),
                3, cv::KMEANS_PP_CENTERS, centers);
 
+        chrono.stop();
 
         img = cv::Scalar::all(0);
 
         centers = centers.reshape(2);
+
+//        std::cout<<labels<<std::endl;
 
         for( i = 0; i < sampleCount; i++ )
         {
@@ -92,7 +151,7 @@ void test_kmeans()
             if(clusterIdx<0)
                 continue;
 
-            std::cout<<"CHECK "<<clusterIdx<<std::endl;
+//            std::cout<<"CHECK "<<clusterIdx<<std::endl;
             cv::Point ipt = points.at<cv::Point2f>(i);
             cv::circle( img, ipt, 2, colorTab[clusterIdx], cv::FILLED, cv::LINE_AA );
         }
@@ -102,6 +161,10 @@ void test_kmeans()
             cv::circle( img, c, 40, colorTab[i], 1, cv::LINE_AA );
         }
         std::cout << "Compactness: " << compactness << std::endl;
+        std::cout << "Processing time: " << chrono.getmus() << std::endl;
+        std::cout << "Number of points: " << sampleCount << std::endl;
+        std::cout << "Number of cluster to find: " << clusterCount << std::endl;
+        std::cout << std::endl;
 
         cv::imshow("clusters", img);
 
